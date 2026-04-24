@@ -3,6 +3,7 @@ import json
 import uuid
 import hashlib
 import base64
+import time
 import urllib.parse
 from typing import AsyncGenerator
 
@@ -24,6 +25,125 @@ MODEL_MAP = {
     "qwen3.5-plus": "Qwen3.5-Plus",
     "doubao-seed-1.8": "Doubao-Seed-1.8",
 }
+
+MODEL_CONFIG_CACHE_TTL_SECONDS = 300
+_model_config_cache: tuple[float, str, list[dict]] | None = None
+
+
+def model_id_from_display_name(display_name: str) -> str:
+    model_id = re.sub(r"[^a-z0-9.]+", "-", display_name.lower()).strip("-")
+    return model_id or display_name.lower()
+
+
+def _fallback_model_options() -> list[dict]:
+    return [
+        {
+            "id": model_id,
+            "object": "model",
+            "owned_by": "tabbit",
+            "display_name": display_name,
+        }
+        for model_id, display_name in MODEL_MAP.items()
+    ]
+
+
+async def get_available_models(base_url: str | None = None) -> list[dict]:
+    global _model_config_cache
+
+    resolved_base_url = (base_url or "https://web.tabbitbrowser.com").rstrip("/")
+    now = time.time()
+    if (
+        _model_config_cache
+        and _model_config_cache[1] == resolved_base_url
+        and now - _model_config_cache[0] < MODEL_CONFIG_CACHE_TTL_SECONDS
+    ):
+        return [dict(item) for item in _model_config_cache[2]]
+
+    try:
+        async with httpx.AsyncClient(verify=False, timeout=8) as client:
+            resp = await client.get(
+                f"{resolved_base_url}/proxy/v1/model_config/models",
+                params={"a": "0"},
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "Referer": f"{resolved_base_url}/newtab",
+                },
+            )
+        resp.raise_for_status()
+        body = resp.json()
+        raw_models = body.get("models") if isinstance(body, dict) else None
+        if not isinstance(raw_models, list):
+            raise ValueError("Tabbit model response missing models")
+
+        models: list[dict] = []
+        seen: set[str] = set()
+        for item in sorted(
+            raw_models,
+            key=lambda value: value.get("sort_order", 9999)
+            if isinstance(value, dict)
+            else 9999,
+        ):
+            if not isinstance(item, dict):
+                continue
+            display_name = item.get("display_name")
+            if not isinstance(display_name, str) or not display_name.strip():
+                continue
+            model_id = model_id_from_display_name(display_name.strip())
+            if model_id in seen:
+                continue
+            seen.add(model_id)
+            models.append(
+                {
+                    "id": model_id,
+                    "object": "model",
+                    "owned_by": "tabbit",
+                    "display_name": display_name.strip(),
+                    "supports_images": bool(item.get("supports_images")),
+                    "supports_tools": bool(item.get("supports_tools")),
+                    "support_thinking": bool(item.get("support_thinking")),
+                    "use_thinking": bool(item.get("use_thinking")),
+                    "model_access_type": item.get("model_access_type"),
+                }
+            )
+
+        if not models:
+            raise ValueError("Tabbit model response empty")
+
+        _model_config_cache = (now, resolved_base_url, models)
+        return [dict(item) for item in models]
+    except Exception:
+        return _fallback_model_options()
+
+
+async def get_available_model_map(base_url: str | None = None) -> dict[str, str]:
+    models = await get_available_models(base_url)
+    return {
+        item["id"]: item.get("display_name", item["id"])
+        for item in models
+        if isinstance(item.get("id"), str)
+    }
+
+
+async def resolve_tabbit_model(
+    model: str | None,
+    base_url: str | None = None,
+    default_model: str = "best",
+) -> str:
+    requested = (model or default_model or "best").lower()
+    model_map = await get_available_model_map(base_url)
+
+    if requested in model_map:
+        return model_map[requested]
+    if requested in MODEL_MAP:
+        return MODEL_MAP[requested]
+
+    for display_name in model_map.values():
+        if display_name.lower() == requested:
+            return display_name
+
+    default_key = (default_model or "best").lower()
+    return model_map.get(default_key) or MODEL_MAP.get(default_key) or model_map.get("best") or MODEL_MAP["best"]
 
 
 class TabbitClient:

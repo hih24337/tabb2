@@ -7,7 +7,7 @@ from fastapi import APIRouter, HTTPException, Header
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from core.tabbit_client import TabbitClient, MODEL_MAP
+from core.tabbit_client import TabbitClient, get_available_models, resolve_tabbit_model
 from core.token_manager import TokenManager
 from core.log_store import LogStore, LogEntry
 from core.config import ConfigManager
@@ -143,7 +143,10 @@ async def chat_completions(
     req: ChatCompletionRequest, authorization: str = Header(None)
 ):
     client, token_name, token_id = await _get_client_and_token(authorization)
-    tabbit_model = MODEL_MAP.get(req.model.lower(), "最佳")
+    tabbit_model = await resolve_tabbit_model(
+        req.model,
+        _cfg.get("tabbit", "base_url") if _cfg else None,
+    )
     content = _build_content(req.messages)
 
     try:
@@ -224,10 +227,8 @@ async def chat_completions(
 
 @router.get("/v1/models")
 async def list_models():
+    models = await get_available_models(_cfg.get("tabbit", "base_url") if _cfg else None)
     return {
         "object": "list",
-        "data": [
-            {"id": k, "object": "model", "owned_by": "tabbit"}
-            for k in MODEL_MAP.keys()
-        ],
+        "data": models,
     }
