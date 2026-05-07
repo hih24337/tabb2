@@ -13,7 +13,7 @@ from fastapi import APIRouter, Request, HTTPException
 from fastapi.responses import StreamingResponse
 
 from core.config import ConfigManager
-from core.tabbit_client import TabbitClient, MODEL_MAP
+from core.tabbit_client import TabbitClient, resolve_tabbit_model
 from core.token_manager import TokenManager
 from core.log_store import LogStore, LogEntry
 from core.claude_compat import (
@@ -52,20 +52,20 @@ def init(token_manager: TokenManager, config: ConfigManager, log_store: LogStore
     _logs = log_store
 
 
-def _resolve_tabbit_model(model: str) -> str:
+async def _resolve_tabbit_model(model: str) -> str:
     """将请求中的模型名映射到 Tabbit 模型"""
-    # 精确匹配
-    if model in MODEL_MAP:
-        return MODEL_MAP[model]
-    # Claude 模型名映射
+    requested = (model or "best").lower()
     for prefix, target in CLAUDE_MODEL_MAP.items():
-        if model.startswith(prefix):
-            return MODEL_MAP.get(target, "最佳")
-    # 从 config 中读取默认模型
-    default = _cfg.get("claude", "default_model") if _cfg else None
-    if default and default in MODEL_MAP:
-        return MODEL_MAP[default]
-    return "最佳"
+        if requested.startswith(prefix):
+            requested = target
+            break
+
+    default = _cfg.get("claude", "default_model") if _cfg else "best"
+    return await resolve_tabbit_model(
+        requested,
+        _cfg.get("tabbit", "base_url") if _cfg else None,
+        default_model=default,
+    )
 
 
 async def _get_client_and_token(
@@ -229,7 +229,7 @@ async def claude_messages(request: Request):
     client, token_name, token_id = await _get_client_and_token(request)
 
     # 模型映射
-    tabbit_model = _resolve_tabbit_model(body.get("model", "best"))
+    tabbit_model = await _resolve_tabbit_model(body.get("model", "best"))
 
     # 工具调用准备
     tools = body.get("tools", [])
