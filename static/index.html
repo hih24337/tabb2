@@ -400,6 +400,10 @@ function showGoogleLogin() {
           </div>
           <div class="rounded-lg border border-zinc-800 bg-zinc-950/50 p-4 space-y-3">
             <p class="text-sm text-zinc-300">打开独立的 Tabbit 登录窗口，点击页面右上角的 Tabbit2API Google 登录按钮；本地服务只监听登录结果并自动保存 Token。</p>
+            <div class="flex items-center gap-2">
+              <input type="checkbox" id="glForceRelogin" class="rounded border-zinc-600 bg-zinc-800 text-zinc-100">
+              <label for="glForceRelogin" class="text-sm text-zinc-400">强制重新登录（清除本地缓存的登录态）</label>
+            </div>
             <button onclick="startGoogleCapture()" class="w-full rounded-lg bg-zinc-100 px-4 py-2.5 text-sm font-medium text-zinc-900 hover:bg-zinc-200 transition-colors">打开 Tabbit 官方登录页</button>
             <div id="glCaptureStatus" class="hidden rounded-lg border border-zinc-800 bg-zinc-900 p-3 text-sm text-zinc-400"></div>
           </div>
@@ -490,6 +494,7 @@ function handleGoogleCredential(response) {
 
 async function startGoogleCapture() {
   const name = (document.getElementById('glName') ? document.getElementById('glName').value.trim() : '') || 'Google Account';
+  const forceRelogin = document.getElementById('glForceRelogin') ? document.getElementById('glForceRelogin').checked : false;
   const status = document.getElementById('glCaptureStatus');
   if (!status) return;
 
@@ -499,7 +504,7 @@ async function startGoogleCapture() {
   try {
     const data = await api('/tokens/google-capture/start', {
       method: 'POST',
-      body: JSON.stringify({ name })
+      body: JSON.stringify({ name, force_relogin: forceRelogin })
     });
     activeGoogleCaptureId = data.capture_id;
     status.textContent = data.message || '请在打开的浏览器窗口右上角点击 Tabbit2API Google 登录按钮...';
@@ -615,11 +620,24 @@ async function testToken(id) {
   btn.innerHTML = '<svg class="w-3.5 h-3.5 animate-spin" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>';
   try {
     const res = await api(`/tokens/${id}/test`, { method: 'POST' });
-    alert(res.ok ? '连接成功!' : `测试失败: ${res.error}`);
+    alert(res.ok ? '连接成功!' : `测试失败: ${formatTokenTestFailure(res)}`);
   } catch (e) {
     alert('测试失败: ' + e.message);
   }
   renderTokens(document.getElementById('pageContent'));
+}
+
+function formatTokenTestFailure(res) {
+  const parts = [res.error || 'unknown error'];
+  const diagnostics = res.diagnostics || {};
+  const browser = diagnostics.windows_default_browser || {};
+  if (browser.http_prog_id || browser.https_prog_id) {
+    parts.push(`Default browser: http=${browser.http_prog_id || 'unknown'}, https=${browser.https_prog_id || 'unknown'}`);
+  }
+  if (diagnostics.tabbit_is_default_browser === false) {
+    parts.push('Tabbit is not the current system default browser.');
+  }
+  return parts.join('\n\n');
 }
 
 async function toggleToken(id, enabled) {

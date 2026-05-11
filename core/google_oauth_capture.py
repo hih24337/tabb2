@@ -15,22 +15,35 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from core.tabbit_client import (
+    TOKEN_METADATA_HEADER_KEYS,
+    encode_token_metadata,
+    sanitize_token_diagnostics,
+)
+
 
 TABBIT_ORIGIN = "https://web.tabbitbrowser.com"
 GOOGLE_CLIENT_ID = "448526856882-gks4gsvgspqkcdt8jsql5b5en0mk3v15.apps.googleusercontent.com"
 CAPTURE_TIMEOUT_SECONDS = 600
+CHROME_IDENTITY_GRACE_SECONDS = 5
+MOA_EXTENSION_ID = "nmbemfeekdkfhjikjegnegkndcehpfej"
+MOA_CERTIFICATE_PROBE_INTERVAL_SECONDS = 5
 
 
 @dataclass
 class CaptureResult:
     kind: str
     value: str
+    chrome_identity_header: str | None = None
+    browser_headers: dict[str, str] = field(default_factory=dict)
+    diagnostics: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass
 class CaptureJob:
     id: str
     name: str
+    force_relogin: bool = False
     status: str = "starting"
     message: str = "正在启动浏览器..."
     result: CaptureResult | None = None
@@ -47,8 +60,8 @@ class GoogleOAuthCaptureManager:
         self._jobs: dict[str, CaptureJob] = {}
         self._lock = threading.Lock()
 
-    def start(self, name: str) -> CaptureJob:
-        job = CaptureJob(id=str(uuid.uuid4()), name=name)
+    def start(self, name: str, force_relogin: bool = False) -> CaptureJob:
+        job = CaptureJob(id=str(uuid.uuid4()), name=name, force_relogin=force_relogin)
         with self._lock:
             self._jobs[job.id] = job
 
@@ -75,9 +88,14 @@ class GoogleOAuthCaptureManager:
             browser_path = _find_browser()
             debug_port = _free_port()
             user_data_dir = tempfile.mkdtemp(prefix="tabbit-google-login-")
-            _seed_user_profile(user_data_dir)
+            # force_relogin 时只 seed 浏览器启动必需的最小数据，跳过所有认证相关文件
+            _seed_user_profile(user_data_dir, auth_only=not job.force_relogin)
             job.user_data_dir = user_data_dir
             login_url = f"{TABBIT_ORIGIN}/login"
+
+            # Capture stderr for debugging launch issues
+            stderr_log_path = Path(user_data_dir) / "_capture_stderr.log"
+            stderr_log_file = open(stderr_log_path, "w", encoding="utf-8")
 
             job.process = subprocess.Popen(
                 [
@@ -90,10 +108,10 @@ class GoogleOAuthCaptureManager:
                     f"--app={login_url}",
                 ],
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=stderr_log_file,
             )
             job.status = "waiting"
-            job.message = "Chrome 窗口（Tabbit AI）已打开，请点击页面右上角的 Tabbit2API Google 登录按钮。"
+            job.message = f"Chrome 窗口（Tabbit AI）已打开，请点击页面右上角的 Tabbit2API Google 登录按钮。(pid={job.process.pid}, port={debug_port})"
 
             websocket_url = _wait_for_debugger(debug_port, job.stop_event)
             result = _listen_for_login_result(websocket_url, job.stop_event)
@@ -135,19 +153,7 @@ def _find_browser() -> str:
 
     candidates: list[str] = []
     if os.name == "nt":
-        for root in (
-            os.environ.get("PROGRAMFILES"),
-            os.environ.get("PROGRAMFILES(X86)"),
-            os.environ.get("LOCALAPPDATA"),
-        ):
-            if not root:
-                continue
-            candidates.extend(
-                [
-                    str(Path(root) / "Google/Chrome/Application/chrome.exe"),
-                    str(Path(root) / "Microsoft/Edge/Application/msedge.exe"),
-                ]
-            )
+        candidates.extend(_windows_browser_candidates(os.environ))
     elif sys_platform() == "darwin":
         candidates.extend(
             [
@@ -168,11 +174,49 @@ def _find_browser() -> str:
     raise RuntimeError("未找到 Chrome 或 Edge。可设置 TABBIT_BROWSER_PATH 指向浏览器可执行文件。")
 
 
-def _seed_user_profile(temp_user_data_dir: str):
+def _windows_browser_candidates(roots: dict[str, str | None]) -> list[str]:
+    candidates: list[str] = []
+
+    for root_name in ("LOCALAPPDATA", "PROGRAMFILES", "PROGRAMFILES(X86)"):
+        root = roots.get(root_name)
+        if not root:
+            continue
+        candidates.extend(
+            [
+                str(Path(root) / "Tabbit/Application/tabbit.exe"),
+                str(Path(root) / "Tabbit/Tabbit.exe"),
+                str(Path(root) / "Programs/Tabbit/Tabbit.exe"),
+            ]
+        )
+
+    for root_name in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"):
+        root = roots.get(root_name)
+        if not root:
+            continue
+        candidates.extend(
+            [
+                str(Path(root) / "Google/Chrome/Application/chrome.exe"),
+                str(Path(root) / "Microsoft/Edge/Application/msedge.exe"),
+            ]
+        )
+
+    return candidates
+
+
+def _seed_user_profile(temp_user_data_dir: str, auth_only: bool = True):
     """
     Clone the minimum profile subset from local Tabbit data so the spawned
     browser can reuse existing login state when available.
+
+    When auth_only=False (force_relogin mode), do NOT copy anything from
+    the Tabbit profile. The browser will start with a completely clean
+    profile, guaranteeing no cached auth state. This is slower to start
+    but forces the user to re-authenticate from scratch.
     """
+    if not auth_only:
+        # force_relogin: skip all profile seeding for a clean slate
+        return
+
     tabbit_user_data = Path(os.environ.get("LOCALAPPDATA", "")) / "Tabbit" / "User Data"
     if not tabbit_user_data.exists():
         return
@@ -191,14 +235,19 @@ def _seed_user_profile(temp_user_data_dir: str):
 
     target_default = destination / "Default"
     target_default.mkdir(parents=True, exist_ok=True)
+
     preserve_paths = [
         "Network",
+        "Preferences",
+        "Web Data",
         "Local Storage",
         "Session Storage",
         "Cookies",
         "Login Data",
-        "Web Data",
-        "Preferences",
+        "IndexedDB",
+        "Local Extension Settings",
+        "Sync Extension Settings",
+        "Extension State",
     ]
     for relative in preserve_paths:
         src = source_default / relative
@@ -262,11 +311,20 @@ def _listen_for_login_result(websocket_url: str, stop_event: threading.Event) ->
         _cdp_send(sock, 3, "Runtime.enable")
         _cdp_send(sock, 4, "Network.getCookies", {"urls": [TABBIT_ORIGIN]})
         _cdp_send(sock, 5, "Runtime.evaluate", _capture_overlay_eval_params())
+        _cdp_send(sock, 6, "Runtime.evaluate", _moa_certificate_eval_params())
 
         deadline = time.time() + CAPTURE_TIMEOUT_SECONDS
-        command_id = 6
+        command_id = 7
         last_cookie_probe = time.time()
         last_overlay_probe = time.time()
+        last_moa_probe = time.time()
+        chrome_identity_header = None
+        browser_headers: dict[str, str] = {}
+        diagnostics: dict[str, object] = {}
+        pending_id_token = None
+        pending_id_token_seen_at = None
+        pending_token_value = None
+        pending_token_seen_at = None
         while time.time() < deadline and not stop_event.is_set():
             try:
                 message = _websocket_recv(sock)
@@ -280,14 +338,57 @@ def _listen_for_login_result(websocket_url: str, stop_event: threading.Event) ->
                     _cdp_send(sock, command_id, "Runtime.evaluate", _capture_overlay_eval_params())
                     command_id += 1
                     last_overlay_probe = now
+                if now - last_moa_probe >= MOA_CERTIFICATE_PROBE_INTERVAL_SECONDS:
+                    _cdp_send(sock, command_id, "Runtime.evaluate", _moa_certificate_eval_params())
+                    command_id += 1
+                    last_moa_probe = now
                 continue
 
             if not message:
                 continue
 
+            chrome_identity_header = (
+                _extract_chrome_identity_header_from_cdp(message)
+                or chrome_identity_header
+            )
+            browser_headers.update(_extract_browser_header_profile_from_cdp(message))
+            diagnostics.update(_extract_moa_certificate_diagnostics_from_cdp(message))
+            if chrome_identity_header and pending_id_token:
+                return CaptureResult(
+                    kind="id_token",
+                    value=pending_id_token,
+                    chrome_identity_header=chrome_identity_header,
+                    browser_headers=dict(browser_headers),
+                    diagnostics=dict(diagnostics),
+                )
+            if chrome_identity_header and pending_token_value:
+                token_value = _append_chrome_identity_header(
+                    pending_token_value,
+                    chrome_identity_header,
+                )
+                token_value = _append_token_metadata(
+                    token_value,
+                    browser_headers=browser_headers,
+                    diagnostics=diagnostics,
+                )
+                return CaptureResult(
+                    kind="tabbit_token",
+                    value=token_value,
+                    diagnostics=dict(diagnostics),
+                )
+
             runtime_id_token = _extract_runtime_id_token_from_cdp(message)
             if runtime_id_token:
-                return CaptureResult(kind="id_token", value=runtime_id_token)
+                if chrome_identity_header:
+                    return CaptureResult(
+                        kind="id_token",
+                        value=runtime_id_token,
+                        chrome_identity_header=chrome_identity_header,
+                        browser_headers=dict(browser_headers),
+                        diagnostics=dict(diagnostics),
+                    )
+                pending_id_token = runtime_id_token
+                pending_id_token_seen_at = time.time()
 
             request_id = _request_id_for_post_data(message)
             if request_id:
@@ -296,13 +397,58 @@ def _listen_for_login_result(websocket_url: str, stop_event: threading.Event) ->
 
             id_token = _extract_id_token_from_cdp(message)
             if id_token:
-                return CaptureResult(kind="id_token", value=id_token)
+                if chrome_identity_header:
+                    return CaptureResult(
+                        kind="id_token",
+                        value=id_token,
+                        chrome_identity_header=chrome_identity_header,
+                        browser_headers=dict(browser_headers),
+                        diagnostics=dict(diagnostics),
+                    )
+                pending_id_token = id_token
+                pending_id_token_seen_at = time.time()
 
-            token_value = _extract_tabbit_token_from_cdp(message)
+            token_value = _extract_tabbit_token_from_cdp(
+                message,
+                chrome_identity_header=chrome_identity_header,
+                browser_headers=browser_headers,
+                diagnostics=diagnostics,
+            )
             if token_value:
-                return CaptureResult(kind="tabbit_token", value=token_value)
+                if chrome_identity_header:
+                    return CaptureResult(
+                        kind="tabbit_token",
+                        value=token_value,
+                        diagnostics=dict(diagnostics),
+                    )
+                pending_token_value = token_value
+                pending_token_seen_at = time.time()
 
             now = time.time()
+            if (
+                pending_id_token
+                and pending_id_token_seen_at
+                and now - pending_id_token_seen_at >= CHROME_IDENTITY_GRACE_SECONDS
+            ):
+                return CaptureResult(
+                    kind="id_token",
+                    value=pending_id_token,
+                    diagnostics=dict(diagnostics),
+                )
+            if (
+                pending_token_value
+                and pending_token_seen_at
+                and now - pending_token_seen_at >= CHROME_IDENTITY_GRACE_SECONDS
+            ):
+                token_value = _append_token_metadata(
+                    pending_token_value,
+                    diagnostics=diagnostics,
+                )
+                return CaptureResult(
+                    kind="tabbit_token",
+                    value=token_value,
+                    diagnostics=dict(diagnostics),
+                )
             if now - last_cookie_probe >= 2:
                 _cdp_send(sock, command_id, "Network.getCookies", {"urls": [TABBIT_ORIGIN]})
                 command_id += 1
@@ -311,6 +457,10 @@ def _listen_for_login_result(websocket_url: str, stop_event: threading.Event) ->
                 _cdp_send(sock, command_id, "Runtime.evaluate", _capture_overlay_eval_params())
                 command_id += 1
                 last_overlay_probe = now
+            if now - last_moa_probe >= MOA_CERTIFICATE_PROBE_INTERVAL_SECONDS:
+                _cdp_send(sock, command_id, "Runtime.evaluate", _moa_certificate_eval_params())
+                command_id += 1
+                last_moa_probe = now
 
         if stop_event.is_set():
             raise RuntimeError("捕获已取消")
@@ -354,6 +504,51 @@ def _capture_overlay_eval_params() -> dict[str, object]:
     return {
         "expression": _capture_overlay_expression(),
         "awaitPromise": False,
+        "returnByValue": True,
+    }
+
+
+def _moa_certificate_eval_params() -> dict[str, object]:
+    extension_id = json.dumps(MOA_EXTENSION_ID)
+    return {
+        "expression": f"""
+(() => new Promise((resolve) => {{
+  const runtime = window.chrome && window.chrome.runtime;
+  if (!runtime || typeof runtime.sendMessage !== "function") {{
+    resolve({{ success: false, error: "chrome.runtime.sendMessage unavailable" }});
+    return;
+  }}
+
+  let settled = false;
+  const finish = (value) => {{
+    if (settled) return;
+    settled = true;
+    resolve(value || {{}});
+  }};
+
+  try {{
+    runtime.sendMessage(
+      {extension_id},
+      {{
+        type: "check_moa_certificate",
+        data: {{}},
+        timestamp: Date.now()
+      }},
+      (response) => {{
+        if (runtime.lastError) {{
+          finish({{ success: false, error: runtime.lastError.message || String(runtime.lastError) }});
+          return;
+        }}
+        finish(response || {{}});
+      }}
+    );
+    setTimeout(() => finish({{ success: false, error: "moa certificate probe timed out" }}), 3000);
+  }} catch (error) {{
+    finish({{ success: false, error: error && error.message ? error.message : String(error) }});
+  }}
+}}))()
+""",
+        "awaitPromise": True,
         "returnByValue": True,
     }
 
@@ -555,9 +750,174 @@ def _extract_runtime_id_token_from_cdp(message: str) -> str | None:
     return None
 
 
-def _extract_tabbit_token_from_cdp(message: str) -> str | None:
+def _extract_chrome_identity_header_from_cdp(message: str) -> str | None:
+    try:
+        event = json.loads(message)
+    except json.JSONDecodeError:
+        return None
+
+    params = event.get("params")
+    if not isinstance(params, dict):
+        return None
+
+    header_sets = []
+    headers = params.get("headers")
+    if isinstance(headers, dict):
+        header_sets.append(headers)
+
+    request = params.get("request")
+    if isinstance(request, dict):
+        request_headers = request.get("headers")
+        if isinstance(request_headers, dict):
+            header_sets.append(request_headers)
+
+    for headers in header_sets:
+        for name, value in headers.items():
+            if str(name).lower() != "x-chrome-id-consistency-request":
+                continue
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+    return None
+
+
+def _extract_browser_header_profile_from_cdp(message: str) -> dict[str, str]:
+    try:
+        event = json.loads(message)
+    except json.JSONDecodeError:
+        return {}
+
+    params = event.get("params")
+    if not isinstance(params, dict):
+        return {}
+
+    header_sets = []
+    headers = params.get("headers")
+    if isinstance(headers, dict):
+        header_sets.append(headers)
+
+    request = params.get("request")
+    if isinstance(request, dict):
+        request_headers = request.get("headers")
+        if isinstance(request_headers, dict):
+            header_sets.append(request_headers)
+
+    profile: dict[str, str] = {}
+    for headers in header_sets:
+        for name, value in headers.items():
+            normalized_name = str(name).lower()
+            if normalized_name not in TOKEN_METADATA_HEADER_KEYS:
+                continue
+            if isinstance(value, str) and value.strip():
+                profile[normalized_name] = value.strip()
+    return profile
+
+
+def _extract_moa_certificate_diagnostics_from_cdp(message: str) -> dict[str, object]:
+    try:
+        event = json.loads(message)
+    except json.JSONDecodeError:
+        return {}
+
+    result = event.get("result")
+    if not isinstance(result, dict):
+        return {}
+
+    runtime_result = result.get("result")
+    if not isinstance(runtime_result, dict):
+        return {}
+
+    value = runtime_result.get("value")
+    if not isinstance(value, dict):
+        return {}
+
+    diagnostics: dict[str, object] = {}
+    success = value.get("success")
+    if isinstance(success, bool):
+        diagnostics["moa_check_success"] = success
+
+    data = value.get("data")
+    if isinstance(data, dict):
+        has_moa_certificate = data.get("hasMoaCertificate")
+        if isinstance(has_moa_certificate, bool):
+            diagnostics["has_moa_certificate"] = has_moa_certificate
+        platform = data.get("platform")
+        if isinstance(platform, str) and platform:
+            diagnostics["moa_platform"] = platform
+
+    error = value.get("error")
+    if isinstance(error, str) and error:
+        diagnostics["moa_error"] = error
+        diagnostics.setdefault("moa_check_available", False)
+
+    return sanitize_token_diagnostics(diagnostics)
+
+
+def _append_chrome_identity_header(token_value: str, chrome_identity_header: str) -> str:
+    parts = token_value.split("|")
+    while len(parts) < 3:
+        parts.append("")
+    if len(parts) == 3:
+        parts.append(chrome_identity_header)
+    else:
+        parts[3] = chrome_identity_header
+    return "|".join(parts)
+
+
+def _append_token_metadata(
+    token_value: str,
+    browser_headers: dict[str, str] | None = None,
+    cookies: dict[str, str] | None = None,
+    diagnostics: dict[str, object] | None = None,
+) -> str:
+    parts = token_value.split("|", 4)
+    metadata: dict[str, object] = {}
+    if len(parts) > 4:
+        try:
+            padded = parts[4] + ("=" * ((4 - len(parts[4]) % 4) % 4))
+            decoded = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+            existing = json.loads(decoded)
+            if isinstance(existing, dict):
+                metadata.update(existing)
+        except Exception:
+            metadata = {}
+
+    if browser_headers:
+        metadata["headers"] = {
+            key: value
+            for key, value in browser_headers.items()
+            if key in TOKEN_METADATA_HEADER_KEYS and isinstance(value, str) and value
+        }
+    if cookies:
+        metadata["cookies"] = {
+            key: value
+            for key, value in cookies.items()
+            if isinstance(key, str) and isinstance(value, str) and value
+        }
+    sanitized_diagnostics = sanitize_token_diagnostics(diagnostics)
+    if sanitized_diagnostics:
+        metadata["diagnostics"] = sanitized_diagnostics
+    if not metadata:
+        return token_value
+
+    while len(parts) < 4:
+        parts.append("")
+    if len(parts) == 4:
+        parts.append(encode_token_metadata(metadata))
+    else:
+        parts[4] = encode_token_metadata(metadata)
+    return "|".join(parts)
+
+
+def _extract_tabbit_token_from_cdp(
+    message: str,
+    chrome_identity_header: str | None = None,
+    browser_headers: dict[str, str] | None = None,
+    diagnostics: dict[str, object] | None = None,
+) -> str | None:
     token = ""
     next_auth = ""
+    captured_cookies: dict[str, str] = {}
     try:
         event = json.loads(message)
     except json.JSONDecodeError:
@@ -589,6 +949,7 @@ def _extract_tabbit_token_from_cdp(message: str) -> str | None:
                 value = cookie.get("value")
                 if not isinstance(value, str):
                     continue
+                captured_cookies[str(cookie.get("name", ""))] = value
                 if name == "token":
                     token = value
                 elif name == "next-auth.session-token":
@@ -600,11 +961,15 @@ def _extract_tabbit_token_from_cdp(message: str) -> str | None:
     if not token:
         return None
 
-    parts = [token]
-    if next_auth:
-        parts.append(next_auth)
-    parts.append(str(uuid.uuid4()))
-    return "|".join(parts)
+    parts = [token, next_auth, str(uuid.uuid4())]
+    if chrome_identity_header:
+        parts.append(chrome_identity_header)
+    return _append_token_metadata(
+        "|".join(parts),
+        browser_headers=browser_headers,
+        cookies=captured_cookies,
+        diagnostics=diagnostics,
+    )
 
 
 def _extract_tabbit_cookies(text: str) -> tuple[str, str]:

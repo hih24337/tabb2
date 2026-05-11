@@ -2,12 +2,201 @@ import re
 import json
 import uuid
 import hashlib
+import hmac
 import base64
 import time
 import urllib.parse
+import os
 from typing import AsyncGenerator
 
 import httpx
+
+TOKEN_METADATA_HEADER_KEYS = {
+    "user-agent": "User-Agent",
+    "sec-ch-ua": "sec-ch-ua",
+    "sec-ch-ua-mobile": "sec-ch-ua-mobile",
+    "sec-ch-ua-platform": "sec-ch-ua-platform",
+    "accept-language": "accept-language",
+}
+TOKEN_METADATA_DIAGNOSTIC_KEYS = {
+    "has_moa_certificate",
+    "moa_platform",
+    "moa_check_success",
+    "moa_check_available",
+    "moa_error",
+}
+CHAT_SIGNING_KEY = "f8d0e6a73f8d4b1a9c3d2e1f9a4b7c6d"
+TABBIT_REQUEST_CONTEXT = "0.30.18(10030018)"
+
+
+def encode_token_metadata(metadata: dict) -> str:
+    raw = json.dumps(metadata, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def decode_token_metadata(value: str | None) -> dict:
+    if not value:
+        return {}
+    try:
+        padded = value + ("=" * ((4 - len(value) % 4) % 4))
+        decoded = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+        metadata = json.loads(decoded)
+        return metadata if isinstance(metadata, dict) else {}
+    except Exception:
+        return {}
+
+
+def sanitize_token_diagnostics(diagnostics: object) -> dict[str, object]:
+    if not isinstance(diagnostics, dict):
+        return {}
+
+    sanitized: dict[str, object] = {}
+    for key, value in diagnostics.items():
+        if key not in TOKEN_METADATA_DIAGNOSTIC_KEYS:
+            continue
+        if isinstance(value, bool):
+            sanitized[key] = value
+        elif isinstance(value, str) and value.strip():
+            sanitized[key] = value.strip()[:200]
+    return sanitized
+
+
+def token_diagnostics_from_value(token_value: str | None) -> dict[str, object]:
+    if not token_value:
+        return {}
+    parts = token_value.split("|", 4)
+    metadata = decode_token_metadata(parts[4] if len(parts) > 4 else None)
+    return sanitize_token_diagnostics(metadata.get("diagnostics"))
+
+
+def _read_windows_registry_string(path: str, value_name: str) -> str | None:
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, path) as key:
+            value, _ = winreg.QueryValueEx(key, value_name)
+            return value if isinstance(value, str) and value else None
+    except Exception:
+        return None
+
+
+def _read_windows_default_browser_prog_id(scheme: str) -> str | None:
+    if os.name != "nt":
+        return None
+
+    base_path = (
+        "Software\\Microsoft\\Windows\\Shell\\Associations\\"
+        f"UrlAssociations\\{scheme}"
+    )
+    return _read_windows_registry_string(
+        f"{base_path}\\UserChoiceLatest\\ProgId",
+        "ProgId",
+    ) or _read_windows_registry_string(
+        f"{base_path}\\UserChoice",
+        "ProgId",
+    )
+
+
+def get_local_tabbit_environment_diagnostics() -> dict[str, object]:
+    diagnostics: dict[str, object] = {}
+    if os.name != "nt":
+        return diagnostics
+
+    http_prog_id = _read_windows_default_browser_prog_id("http")
+    https_prog_id = _read_windows_default_browser_prog_id("https")
+    if http_prog_id or https_prog_id:
+        diagnostics["windows_default_browser"] = {
+            "http_prog_id": http_prog_id or "",
+            "https_prog_id": https_prog_id or "",
+        }
+        diagnostics["tabbit_is_default_browser"] = all(
+            "tabbit" in (value or "").lower()
+            for value in (http_prog_id, https_prog_id)
+        )
+    return diagnostics
+
+
+def build_tabbit_error_message(
+    error,
+    token_value: str | None = None,
+    local_diagnostics: dict[str, object] | None = None,
+) -> str:
+    message = f"[Tabbit API Error {error.code}] {error.message}"
+    is_update_gate = error.code == 493 or error.action == "update_version"
+    if not is_update_gate:
+        return message
+
+    token_diagnostics = token_diagnostics_from_value(token_value)
+    diagnostics = local_diagnostics or {}
+    parts = [message]
+
+    if token_diagnostics.get("has_moa_certificate") is False:
+        parts.append(
+            "Diagnostics: hasMoaCertificate=false. Tabbit AI entitlement is "
+            "not active for this local Tabbit profile."
+        )
+    else:
+        parts.append(
+            "Diagnostics: Tabbit rejected AI access with update_version. "
+            "This is usually an app entitlement/default-browser gate, not a "
+            "plain token refresh problem."
+        )
+
+    windows_default = diagnostics.get("windows_default_browser")
+    if isinstance(windows_default, dict):
+        http_prog_id = windows_default.get("http_prog_id", "")
+        https_prog_id = windows_default.get("https_prog_id", "")
+        parts.append(
+            f"Local default browser: http={http_prog_id or 'unknown'}, "
+            f"https={https_prog_id or 'unknown'}."
+        )
+
+    if diagnostics.get("tabbit_is_default_browser") is True:
+        parts.append(
+            "Tabbit is already the system default browser. Open the real "
+            "Tabbit browser profile, activate Tabbit AI/MOA entitlement, make "
+            "sure any in-browser AI membership prompt is cleared, then "
+            "capture/login again and retest."
+        )
+    else:
+        parts.append(
+            "Set Tabbit as the system default browser, reopen Tabbit, make sure "
+            "the in-browser AI membership/default-browser prompt is cleared, then "
+            "capture/login again and retest."
+        )
+    return " ".join(parts)
+
+
+def build_chat_signature_headers(
+    body: str,
+    timestamp: str | None = None,
+    signature: str | None = None,
+    signing_key: str = CHAT_SIGNING_KEY,
+) -> dict[str, str]:
+    resolved_timestamp = timestamp or str(int(time.time() * 1000))
+    resolved_signature = signature or str(uuid.uuid4())
+    body_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    signed_payload = f"{resolved_timestamp}.{resolved_signature}.{body_hash}"
+    nonce = hmac.new(
+        signing_key.encode("utf-8"),
+        signed_payload.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return {
+        "x-timestamp": resolved_timestamp,
+        "x-nonce": nonce,
+        "x-signature": resolved_signature,
+    }
+
+
+class TabbitApiError(Exception):
+    """Raised when the Tabbit upstream API returns an error event."""
+
+    def __init__(self, code: int = 0, message: str = "", action: str = ""):
+        self.code = code
+        self.message = message
+        self.action = action
+        super().__init__(f"Tabbit API error {code}: {message} (action={action})")
 
 MODEL_MAP = {
     "best": "最佳",
@@ -148,10 +337,12 @@ async def resolve_tabbit_model(
 
 class TabbitClient:
     def __init__(self, token_str: str, base_url: str | None = None, client_id: str | None = None):
-        parts = token_str.split("|")
+        parts = token_str.split("|", 4)
         self.jwt_token = parts[0]
-        self.next_auth = parts[1] if len(parts) > 1 else None
-        self.device_id = parts[2] if len(parts) > 2 else str(uuid.uuid4())
+        self.next_auth = parts[1] if len(parts) > 1 and parts[1] else None
+        self.device_id = parts[2] if len(parts) > 2 and parts[2] else str(uuid.uuid4())
+        self.chrome_identity_header = parts[3] if len(parts) > 3 and parts[3] else None
+        self.metadata = decode_token_metadata(parts[4] if len(parts) > 4 else None)
         self.user_id = self._extract_user_id(self.jwt_token)
         self.base_url = base_url or "https://web.tabbitbrowser.com"
         self.client_id = client_id or "e7fa44387b1238ef1f6f"
@@ -172,25 +363,35 @@ class TabbitClient:
             return str(uuid.uuid4())
 
     def _get_headers(self, referer_path: str = "/newtab") -> dict:
-        return {
+        chrome_identity_header = self.chrome_identity_header or (
+            f"version=1,client_id={self.client_id},"
+            f"device_id={self.device_id},sync_account_id={self.user_id},"
+            "signin_mode=all_accounts,signout_mode=show_confirmation"
+        )
+        headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
             "sec-ch-ua": '"Not:A-Brand";v="99", "Tabbit";v="145", "Chromium";v="145"',
             "sec-ch-ua-platform": '"Windows"',
-            "x-chrome-id-consistency-request": (
-                f"version=1,client_id={self.client_id},"
-                f"device_id={self.device_id},sync_account_id={self.user_id},"
-                "signin_mode=all_accounts,signout_mode=show_confirmation"
-            ),
+            "x-chrome-id-consistency-request": chrome_identity_header,
             "referer": f"{self.base_url}{referer_path}",
         }
+        metadata_headers = self.metadata.get("headers")
+        if isinstance(metadata_headers, dict):
+            for source_key, target_key in TOKEN_METADATA_HEADER_KEYS.items():
+                value = metadata_headers.get(source_key)
+                if isinstance(value, str) and value.strip():
+                    headers[target_key] = value.strip()
+        return headers
 
     def _get_cookies(self) -> dict:
-        cookies = {
+        metadata_cookies = self.metadata.get("cookies")
+        cookies = dict(metadata_cookies) if isinstance(metadata_cookies, dict) else {}
+        cookies.update({
             "token": self.jwt_token,
             "user_id": self.user_id,
             "managed": "tab_browser",
             "NEXT_LOCALE": "zh",
-        }
+        })
         if self.next_auth:
             cookies["next-auth.session-token"] = self.next_auth
         return cookies
@@ -243,26 +444,37 @@ class TabbitClient:
     ) -> AsyncGenerator[dict, None]:
         payload = {
             "chat_session_id": session_id,
+            "message_id": None,
             "content": content,
             "selected_model": model,
+            "parallel_group_id": None,
+            "task_name": "chat",
             "agent_mode": False,
             "metadatas": {"html_content": f"<p>{content}</p>"},
+            "references": [],
             "entity": {
                 "key": hashlib.md5(b"").hexdigest(),
                 "extras": {"type": "tab", "url": ""},
             },
         }
 
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         headers = {
             **self._get_headers(f"/chat/{session_id}"),
             "Accept": "text/event-stream",
             "Content-Type": "application/json",
+            "Cache-Control": "no-cache",
+            "x-req-ctx": base64.b64encode(
+                TABBIT_REQUEST_CONTEXT.encode("utf-8")
+            ).decode("ascii"),
+            "unique-uuid": str(uuid.uuid4()),
+            **build_chat_signature_headers(body),
         }
 
         async with self.client.stream(
             "POST",
-            f"{self.base_url}/chat/send",
-            json=payload,
+            f"{self.base_url}/api/v1/chat/completion",
+            content=body,
             headers=headers,
             cookies=self._get_cookies(),
         ) as resp:
@@ -279,6 +491,20 @@ class TabbitClient:
                 elif line.startswith("data:") and current_event:
                     data_str = line[len("data:") :].strip()
                     try:
-                        yield {"event": current_event, "data": json.loads(data_str)}
+                        data = json.loads(data_str)
                     except Exception:
-                        pass
+                        continue
+
+                    # Check for upstream error events
+                    if current_event == "error" and isinstance(data, dict):
+                        error_code = data.get("code", 0)
+                        error_msg = data.get("message", "Unknown error")
+                        raise TabbitApiError(
+                            code=error_code,
+                            message=error_msg,
+                            action=data.get("action", ""),
+                        )
+
+                    yield {"event": current_event, "data": data}
+                    if current_event == "close":
+                        break
