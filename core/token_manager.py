@@ -71,12 +71,12 @@ class TokenManager:
                 break
         self.config.save()
 
-    def report_error(self, token_id: str):
+    def report_error(self, token_id: str, cooldown: bool = True):
         for t in self.config.get("tokens", default=[]):
             if t["id"] == token_id:
                 t["error_count"] = t.get("error_count", 0) + 1
                 t["total_requests"] = t.get("total_requests", 0) + 1
-                if t["error_count"] >= MAX_CONSECUTIVE_ERRORS:
+                if cooldown and t["error_count"] >= MAX_CONSECUTIVE_ERRORS:
                     self._cooldowns[t["id"]] = time.time() + COOLDOWN_SECONDS
                     t["status"] = "cooldown"
                 else:
