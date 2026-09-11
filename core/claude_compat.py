@@ -304,7 +304,15 @@ class ToolifyParser:
     - 其余 → 普通文本
 
     事件类型: text / tool_call / thinking / end
+
+    设计要点：
+    - 文本实时发出，不再等待 256 字符缓冲
+    - 需要前瞻检测 <thinking> 和 trigger_signal，保留一个安全窗口
+    - 窗口长度 = max(len(THINKING_START_TAG), len(trigger_signal or ''))
     """
+
+    # 前瞻安全边距：多保留几个字符防止切割多字节 UTF-8（实际 ASCII 标签无此问题，但留余量）
+    _LOOKAHEAD_PAD = 2
 
     def __init__(
         self, trigger_signal: str | None = None, thinking_enabled: bool = False
@@ -317,6 +325,14 @@ class ToolifyParser:
         self.thinking_mode = False
         self.thinking_buffer = ""
         self.events: list[dict] = []
+
+    @property
+    def _safe_window(self) -> int:
+        """前瞻安全窗口：必须 >= 可能匹配的最长标签长度"""
+        candidates = [len(THINKING_START_TAG)]
+        if self.trigger_signal:
+            candidates.append(len(self.trigger_signal))
+        return max(candidates) + self._LOOKAHEAD_PAD
 
     def feed_char(self, char: str):
         if not self.trigger_signal:
@@ -343,12 +359,17 @@ class ToolifyParser:
             self.buffer = ""
             self.capturing = True
             self.capture_buffer = ""
+        else:
+            self._flush_safe_text()
 
     def finish(self):
         if self.buffer:
             self.events.append({"type": "text", "content": self.buffer})
         if self.thinking_enabled and self.thinking_mode and self.thinking_buffer:
-            content = re.sub(r"^\s*>\s*", "", self.thinking_buffer)
+            content = self.thinking_buffer
+            if content.endswith(THINKING_END_TAG):
+                content = content[: -len(THINKING_END_TAG)]
+            content = re.sub(r"^\s*>\s*", "", content)
             if content:
                 self.events.append({"type": "thinking", "content": content})
         self._try_emit_invokes(force=True)
@@ -363,6 +384,22 @@ class ToolifyParser:
         pending = self.events[:]
         self.events.clear()
         return pending
+
+    def _flush_safe_text(self):
+        """将 buffer 中安全的部分作为 text 事件发出，保留前瞻窗口。
+
+        核心思路：buffer 尾部可能是不完整的 <thinking> 或 trigger_signal 前缀，
+        需要保留足够长的尾部来等后续字符确认。其余部分可以立即发出。
+        """
+        window = self._safe_window
+        if len(self.buffer) <= window:
+            return
+
+        safe_end = len(self.buffer) - window
+        safe_text = self.buffer[:safe_end]
+        self.buffer = self.buffer[safe_end:]
+        if safe_text:
+            self.events.append({"type": "text", "content": safe_text})
 
     def _try_emit_invokes(self, force: bool = False):
         lower = self.capture_buffer.lower()
@@ -429,9 +466,7 @@ class ToolifyParser:
     def _handle_char_without_trigger(self, char: str):
         if not self.thinking_enabled:
             self.buffer += char
-            if len(self.buffer) >= 256:
-                self.events.append({"type": "text", "content": self.buffer})
-                self.buffer = ""
+            self._flush_safe_text_no_trigger()
             return
 
         if self.thinking_mode:
@@ -443,6 +478,8 @@ class ToolifyParser:
                     self.events.append({"type": "thinking", "content": content})
                 self.thinking_buffer = ""
                 self.thinking_mode = False
+            else:
+                self._flush_thinking_safe()
             return
 
         self.buffer += char
@@ -453,11 +490,36 @@ class ToolifyParser:
             self.buffer = ""
             self.thinking_mode = True
             self.thinking_buffer = ""
-            return
+        else:
+            self._flush_safe_text_no_trigger()
 
-        if len(self.buffer) >= 256:
-            self.events.append({"type": "text", "content": self.buffer})
-            self.buffer = ""
+    def _flush_safe_text_no_trigger(self):
+        """无 trigger signal 时，只需前瞻 <thinking> 标签。"""
+        if not self.thinking_enabled:
+            # 完全不需要前瞻，每个字符都可以实时发出
+            if self.buffer:
+                self.events.append({"type": "text", "content": self.buffer})
+                self.buffer = ""
+            return
+        window = len(THINKING_START_TAG) + self._LOOKAHEAD_PAD
+        if len(self.buffer) <= window:
+            return
+        safe_end = len(self.buffer) - window
+        safe_text = self.buffer[:safe_end]
+        self.buffer = self.buffer[safe_end:]
+        if safe_text:
+            self.events.append({"type": "text", "content": safe_text})
+
+    def _flush_thinking_safe(self):
+        """Thinking 缓冲区也需要实时发出，但保留 </thinking> 前瞻窗口。"""
+        window = len(THINKING_END_TAG) + self._LOOKAHEAD_PAD
+        if len(self.thinking_buffer) <= window:
+            return
+        safe_end = len(self.thinking_buffer) - window
+        content = self.thinking_buffer[:safe_end]
+        self.thinking_buffer = self.thinking_buffer[safe_end:]
+        if content:
+            self.events.append({"type": "thinking", "content": content})
 
     def _check_thinking_mode(self, char: str):
         if not self.thinking_mode:
