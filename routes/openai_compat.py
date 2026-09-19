@@ -7,7 +7,14 @@ from fastapi import APIRouter, HTTPException, Header
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from core.tabbit_client import TabbitClient, MODEL_MAP
+from core.tabbit_client import (
+    TabbitClient,
+    build_tabbit_error_message,
+    get_available_models,
+    get_local_tabbit_environment_diagnostics,
+    resolve_tabbit_model,
+    TabbitApiError,
+)
 from core.token_manager import TokenManager
 from core.log_store import LogStore, LogEntry
 from core.config import ConfigManager
@@ -54,6 +61,16 @@ def _build_content(messages: list[ChatMessage]) -> str:
         )
         parts.append(f"[{label}]: {m.content}")
     return "\n\n".join(parts) + "\n\n[Assistant]:"
+
+
+def _token_value_for_id(token_id: str) -> str | None:
+    if not token_id or not _cfg:
+        return None
+    for token in _cfg.get("tokens", default=[]):
+        if token.get("id") == token_id:
+            value = token.get("value")
+            return value if isinstance(value, str) else None
+    return None
 
 
 async def _get_client_and_token(
@@ -111,14 +128,38 @@ async def _stream_handler(client, session_id, content, tabbit_model, req_model, 
                     ],
                 }
                 yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-            elif et in ("message_finish", "finish"):
-                yield (
-                    f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
-                )
 
+        yield (
+            f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
+        )
         yield "data: [DONE]\n\n"
         if token_id:
             _tm.report_success(token_id)
+    except TabbitApiError as e:
+        error_msg = str(e)
+        if token_id:
+            _tm.report_error(token_id, cooldown=False)
+        err_text = build_tabbit_error_message(
+            e,
+            token_value=_token_value_for_id(token_id),
+            local_diagnostics=get_local_tabbit_environment_diagnostics(),
+        )
+        error_chunk = {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"content": err_text},
+                    "finish_reason": None,
+                }
+            ],
+        }
+        yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n"
+        yield (
+            f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
+        )
+        yield "data: [DONE]\n\n"
     except Exception as e:
         error_msg = str(e)
         if token_id:
@@ -126,16 +167,17 @@ async def _stream_handler(client, session_id, content, tabbit_model, req_model, 
         raise
     finally:
         duration = time.time() - start
-        _logs.add(
-            LogEntry(
-                model=req_model,
-                token_name=token_name,
-                stream=True,
-                status="success" if not error_msg else "error",
-                duration=duration,
-                error=error_msg,
+        if _logs:
+            _logs.add(
+                LogEntry(
+                    model=req_model,
+                    token_name=token_name,
+                    stream=True,
+                    status="success" if not error_msg else "error",
+                    duration=duration,
+                    error=error_msg,
+                )
             )
-        )
 
 
 @router.post("/v1/chat/completions")
@@ -143,7 +185,10 @@ async def chat_completions(
     req: ChatCompletionRequest, authorization: str = Header(None)
 ):
     client, token_name, token_id = await _get_client_and_token(authorization)
-    tabbit_model = MODEL_MAP.get(req.model.lower(), "最佳")
+    tabbit_model = await resolve_tabbit_model(
+        req.model,
+        _cfg.get("tabbit", "base_url") if _cfg else None,
+    )
     content = _build_content(req.messages)
 
     try:
@@ -189,6 +234,18 @@ async def chat_completions(
                 full_text += event["data"].get("content", "")
         if token_id:
             _tm.report_success(token_id)
+    except TabbitApiError as e:
+        error_msg = str(e)
+        if token_id:
+            _tm.report_error(token_id, cooldown=False)
+        raise HTTPException(
+            status_code=502,
+            detail=build_tabbit_error_message(
+                e,
+                token_value=_token_value_for_id(token_id),
+                local_diagnostics=get_local_tabbit_environment_diagnostics(),
+            ),
+        )
     except Exception as e:
         error_msg = str(e)
         if token_id:
@@ -224,10 +281,8 @@ async def chat_completions(
 
 @router.get("/v1/models")
 async def list_models():
+    models = await get_available_models(_cfg.get("tabbit", "base_url") if _cfg else None)
     return {
         "object": "list",
-        "data": [
-            {"id": k, "object": "model", "owned_by": "tabbit"}
-            for k in MODEL_MAP.keys()
-        ],
+        "data": models,
     }
