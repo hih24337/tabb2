@@ -8,8 +8,18 @@ from typing import Optional
 
 from core.config import ConfigManager, hash_password
 from core.auth import create_jwt, verify_password, require_admin
+from core.google_oauth_capture import GoogleOAuthCaptureManager
 from core.token_manager import TokenManager
-from core.tabbit_client import TabbitClient
+from core.tabbit_client import (
+    TOKEN_METADATA_HEADER_KEYS,
+    TabbitApiError,
+    TabbitClient,
+    build_tabbit_error_message,
+    encode_token_metadata,
+    get_local_tabbit_environment_diagnostics,
+    resolve_tabbit_model,
+    sanitize_token_diagnostics,
+)
 from core.log_store import LogStore
 
 logger = logging.getLogger("tabbit2openai")
@@ -18,6 +28,7 @@ logger = logging.getLogger("tabbit2openai")
 _cfg: ConfigManager | None = None
 _tm: TokenManager | None = None
 _logs: LogStore | None = None
+_google_capture = GoogleOAuthCaptureManager()
 
 # Pydantic models（需在模块级定义才能被 FastAPI 正确解析）
 class LoginRequest(BaseModel):
@@ -47,6 +58,10 @@ class SettingsUpdateRequest(BaseModel):
 class GoogleLoginRequest(BaseModel):
     id_token: str
 
+class GoogleCaptureStartRequest(BaseModel):
+    name: str = "Google Account"
+    force_relogin: bool = False
+
 class PasswordUpdateRequest(BaseModel):
     old_password: str
     new_password: str
@@ -54,6 +69,128 @@ class PasswordUpdateRequest(BaseModel):
 
 # router 初始为占位，init() 后替换为带鉴权的完整路由
 router = APIRouter(prefix="/api/admin")
+
+
+async def exchange_google_id_token(
+    config: ConfigManager,
+    id_token: str,
+    chrome_identity_header: str | None = None,
+    browser_headers: dict[str, str] | None = None,
+    diagnostics: dict[str, object] | None = None,
+) -> dict:
+    """用 Google id_token 调用 Tabbit API 换取登录凭据，返回格式化后的 token。"""
+    import httpx as _httpx
+
+    base_url = config.get("tabbit", "base_url") or "https://web.tabbitbrowser.com"
+    tabbit_url = base_url + "/proxy/v0/oauth/third-party-login"
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+        "Origin": base_url,
+        "Referer": base_url + "/login",
+    }
+    if chrome_identity_header:
+        headers.update(
+            {
+                "sec-ch-ua": '"Not:A-Brand";v="99", "Tabbit";v="145", "Chromium";v="145"',
+                "sec-ch-ua-platform": '"Windows"',
+                "x-chrome-id-consistency-request": chrome_identity_header,
+            }
+        )
+    if browser_headers:
+        for source_key, target_key in TOKEN_METADATA_HEADER_KEYS.items():
+            value = browser_headers.get(source_key)
+            if isinstance(value, str) and value.strip():
+                headers[target_key] = value.strip()
+    async with _httpx.AsyncClient(verify=False, timeout=15) as hc:
+        resp = await hc.post(
+            tabbit_url,
+            json={"id_token": id_token, "select_by": "btn", "type": 1},
+            headers=headers,
+        )
+
+    try:
+        body = resp.json()
+    except Exception:
+        raise HTTPException(status_code=502, detail=f"Tabbit API 返回异常: {resp.text[:200]}")
+
+    if resp.status_code != 200 or not body.get("success"):
+        raise HTTPException(
+            status_code=resp.status_code or 400,
+            detail=body.get("detail") or body.get("message") or "登录失败",
+        )
+
+    import re as _re
+    cookies = {}
+    for h in resp.headers.multi_items():
+        if h[0].lower() == "set-cookie":
+            m = _re.match(r"([^=]+)=([^;]*)", h[1])
+            if m:
+                cookies[m.group(1).strip()] = m.group(2).strip()
+
+    jwt_token = cookies.get("token", "")
+    next_auth = cookies.get("next-auth.session-token", "")
+    device_id = str(uuid.uuid4())
+
+    data = body.get("data")
+    if isinstance(data, dict):
+        jwt_token = jwt_token or data.get("token", "") or data.get("access_token", "")
+        next_auth = next_auth or data.get("session_token", "")
+
+    if not jwt_token:
+        raise HTTPException(status_code=502, detail="未能从 Tabbit 响应中提取 token")
+
+    parts = [jwt_token, next_auth, device_id]
+    if chrome_identity_header:
+        parts.append(chrome_identity_header)
+    metadata: dict[str, object] = {}
+    if browser_headers:
+        metadata["headers"] = {
+            key: value
+            for key, value in browser_headers.items()
+            if key in TOKEN_METADATA_HEADER_KEYS and isinstance(value, str) and value
+        }
+    if cookies:
+        metadata["cookies"] = {
+            key: value
+            for key, value in cookies.items()
+            if isinstance(key, str) and isinstance(value, str) and value
+        }
+    sanitized_diagnostics = sanitize_token_diagnostics(diagnostics)
+    if sanitized_diagnostics:
+        metadata["diagnostics"] = sanitized_diagnostics
+    if metadata:
+        while len(parts) < 4:
+            parts.append("")
+        parts.append(encode_token_metadata(metadata))
+
+    return {"ok": True, "token_value": "|".join(parts), "cookies": cookies, "body": body}
+
+
+def add_token_entry(name: str, value: str) -> dict:
+    token_entry = {
+        "id": str(uuid.uuid4()),
+        "name": name,
+        "value": value,
+        "enabled": True,
+        "added_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "last_used_at": None,
+        "total_requests": 0,
+        "error_count": 0,
+        "status": "unknown",
+    }
+    tokens = _cfg.get("tokens", default=[])
+    tokens.append(token_entry)
+    _cfg.config["tokens"] = tokens
+    _cfg.save()
+    return token_entry
+
+
+async def _probe_tabbit_chat(client, model: str) -> str:
+    session_id = await client.create_chat_session()
+    async for _ in client.send_message(session_id, "ping", model):
+        break
+    return session_id
 
 
 def init(config: ConfigManager, token_manager: TokenManager, log_store: LogStore):
@@ -111,21 +248,10 @@ def init(config: ConfigManager, token_manager: TokenManager, log_store: LogStore
 
     @r.post("/tokens", dependencies=[Depends(admin_dep)])
     async def add_token(req: TokenAddRequest):
-        token_entry = {
-            "id": str(uuid.uuid4()),
-            "name": req.name,
-            "value": req.value,
-            "enabled": req.enabled,
-            "added_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "last_used_at": None,
-            "total_requests": 0,
-            "error_count": 0,
-            "status": "unknown",
-        }
-        tokens = _cfg.get("tokens", default=[])
-        tokens.append(token_entry)
-        _cfg.config["tokens"] = tokens
-        _cfg.save()
+        token_entry = add_token_entry(req.name, req.value)
+        if not req.enabled:
+            token_entry["enabled"] = False
+            _cfg.save()
         return {"id": token_entry["id"]}
 
     @r.put("/tokens/{token_id}", dependencies=[Depends(admin_dep)])
@@ -167,13 +293,33 @@ def init(config: ConfigManager, token_manager: TokenManager, log_store: LogStore
             _cfg.get("tabbit", "client_id"),
         )
         try:
-            session_id = await client.create_chat_session()
+            base_url = _cfg.get("tabbit", "base_url")
+            default_model = _cfg.get("claude", "default_model", default="best")
+            model = await resolve_tabbit_model(default_model, base_url, "best")
+            session_id = await _probe_tabbit_chat(client, model)
             target["status"] = "active"
             target["error_count"] = 0
             _cfg.save()
             return {"ok": True, "session_id": session_id}
+        except TabbitApiError as e:
+            target["status"] = "error"
+            target["error_count"] = int(target.get("error_count") or 0) + 1
+            _cfg.save()
+            diagnostics = get_local_tabbit_environment_diagnostics()
+            return {
+                "ok": False,
+                "error": build_tabbit_error_message(
+                    e,
+                    token_value=target.get("value", ""),
+                    local_diagnostics=diagnostics,
+                ),
+                "code": e.code,
+                "action": e.action,
+                "diagnostics": diagnostics,
+            }
         except Exception as e:
             target["status"] = "error"
+            target["error_count"] = int(target.get("error_count") or 0) + 1
             _cfg.save()
             return {"ok": False, "error": str(e)}
         finally:
@@ -181,64 +327,61 @@ def init(config: ConfigManager, token_manager: TokenManager, log_store: LogStore
 
     @r.post("/tokens/google-login", dependencies=[Depends(admin_dep)])
     async def google_login(req: GoogleLoginRequest):
-        """用 Google id_token 调用 Tabbit API 换取登录凭据，返回格式化后的 token"""
-        import httpx as _httpx
+        return await exchange_google_id_token(_cfg, req.id_token)
 
-        tabbit_url = (
-            (_cfg.get("tabbit", "base_url") or "https://web.tabbitbrowser.com")
-            + "/proxy/v0/oauth/third-party-login"
-        )
-        async with _httpx.AsyncClient(verify=False, timeout=15) as hc:
-            resp = await hc.post(
-                tabbit_url,
-                json={"id_token": req.id_token, "select_by": "btn", "type": 1},
-                headers={
-                    "Content-Type": "application/json",
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                    "Origin": _cfg.get("tabbit", "base_url") or "https://web.tabbitbrowser.com",
-                    "Referer": (_cfg.get("tabbit", "base_url") or "https://web.tabbitbrowser.com") + "/login",
-                },
-            )
+    @r.post("/tokens/google-capture/start", dependencies=[Depends(admin_dep)])
+    async def start_google_capture(req: GoogleCaptureStartRequest):
+        name = req.name.strip() or "Google Account"
+        job = _google_capture.start(name, force_relogin=req.force_relogin)
+        return {"ok": True, "capture_id": job.id, "status": job.status, "message": job.message}
 
-        try:
-            body = resp.json()
-        except Exception:
-            raise HTTPException(status_code=502, detail=f"Tabbit API 返回异常: {resp.text[:200]}")
+    @r.get("/tokens/google-capture/{capture_id}", dependencies=[Depends(admin_dep)])
+    async def get_google_capture(capture_id: str):
+        job = _google_capture.get(capture_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="capture job not found")
 
-        if resp.status_code != 200 or not body.get("success"):
-            raise HTTPException(
-                status_code=resp.status_code or 400,
-                detail=body.get("detail") or body.get("message") or "登录失败",
-            )
+        if job.status == "captured" and job.result:
+            try:
+                if job.result.kind == "id_token":
+                    data = await exchange_google_id_token(
+                        _cfg,
+                        job.result.value,
+                        chrome_identity_header=job.result.chrome_identity_header,
+                        browser_headers=job.result.browser_headers,
+                        diagnostics=job.result.diagnostics,
+                    )
+                    token_value = data["token_value"]
+                elif job.result.kind == "tabbit_token":
+                    token_value = job.result.value
+                else:
+                    raise HTTPException(status_code=502, detail="unsupported capture result")
 
-        # 从 Set-Cookie 提取 token
-        import re as _re
-        cookies = {}
-        for h in resp.headers.multi_items():
-            if h[0].lower() == "set-cookie":
-                m = _re.match(r"([^=]+)=([^;]*)", h[1])
-                if m:
-                    cookies[m.group(1).strip()] = m.group(2).strip()
+                token_entry = add_token_entry(job.name, token_value)
+                job.result = None
+                job.token_id = token_entry["id"]
+                job.status = "saved"
+                job.message = "Token 已保存"
+            except HTTPException as exc:
+                job.result = None
+                job.status = "error"
+                job.error = str(exc.detail)
+                job.message = job.error
 
-        jwt_token = cookies.get("token", "")
-        next_auth = cookies.get("next-auth.session-token", "")
-        device_id = str(uuid.uuid4())
+        return {
+            "ok": job.status not in {"error", "cancelled"},
+            "capture_id": job.id,
+            "status": job.status,
+            "message": job.message,
+            "token_id": job.token_id,
+            "error": job.error,
+        }
 
-        # 也尝试从 body.data 取
-        data = body.get("data")
-        if isinstance(data, dict):
-            jwt_token = jwt_token or data.get("token", "") or data.get("access_token", "")
-            next_auth = next_auth or data.get("session_token", "")
-
-        if not jwt_token:
-            raise HTTPException(status_code=502, detail="未能从 Tabbit 响应中提取 token")
-
-        parts = [jwt_token]
-        if next_auth:
-            parts.append(next_auth)
-        parts.append(device_id)
-
-        return {"ok": True, "token_value": "|".join(parts), "cookies": cookies, "body": body}
+    @r.delete("/tokens/google-capture/{capture_id}", dependencies=[Depends(admin_dep)])
+    async def cancel_google_capture(capture_id: str):
+        if not _google_capture.cancel(capture_id):
+            raise HTTPException(status_code=404, detail="capture job not found")
+        return {"ok": True}
 
     # ── Settings ──
 

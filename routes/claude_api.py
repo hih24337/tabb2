@@ -13,7 +13,13 @@ from fastapi import APIRouter, Request, HTTPException
 from fastapi.responses import StreamingResponse
 
 from core.config import ConfigManager
-from core.tabbit_client import TabbitClient, MODEL_MAP
+from core.tabbit_client import (
+    TabbitClient,
+    build_tabbit_error_message,
+    get_local_tabbit_environment_diagnostics,
+    resolve_tabbit_model,
+    TabbitApiError,
+)
 from core.token_manager import TokenManager
 from core.log_store import LogStore, LogEntry
 from core.claude_compat import (
@@ -23,7 +29,12 @@ from core.claude_compat import (
     estimate_tokens,
     ToolifyParser,
     ClaudeSSEWriter,
+    THINKING_START_TAG,
+    THINKING_END_TAG,
 )
+
+# ping 间隔秒数（Anthropic 官方约 15-30 秒发一次 ping）
+PING_INTERVAL_SECONDS = 15
 
 logger = logging.getLogger("tabbit2openai")
 
@@ -52,20 +63,30 @@ def init(token_manager: TokenManager, config: ConfigManager, log_store: LogStore
     _logs = log_store
 
 
-def _resolve_tabbit_model(model: str) -> str:
+async def _resolve_tabbit_model(model: str) -> str:
     """将请求中的模型名映射到 Tabbit 模型"""
-    # 精确匹配
-    if model in MODEL_MAP:
-        return MODEL_MAP[model]
-    # Claude 模型名映射
+    requested = (model or "best").lower()
     for prefix, target in CLAUDE_MODEL_MAP.items():
-        if model.startswith(prefix):
-            return MODEL_MAP.get(target, "最佳")
-    # 从 config 中读取默认模型
-    default = _cfg.get("claude", "default_model") if _cfg else None
-    if default and default in MODEL_MAP:
-        return MODEL_MAP[default]
-    return "最佳"
+        if requested.startswith(prefix):
+            requested = target
+            break
+
+    default = _cfg.get("claude", "default_model") if _cfg else "best"
+    return await resolve_tabbit_model(
+        requested,
+        _cfg.get("tabbit", "base_url") if _cfg else None,
+        default_model=default,
+    )
+
+
+def _token_value_for_id(token_id: str) -> str | None:
+    if not token_id or not _cfg:
+        return None
+    for token in _cfg.get("tokens", default=[]):
+        if token.get("id") == token_id:
+            value = token.get("value")
+            return value if isinstance(value, str) else None
+    return None
 
 
 async def _get_client_and_token(
@@ -151,7 +172,6 @@ async def _stream_claude_response(
 
     # 解析器配置
     tools = body.get("tools", [])
-    has_tools = len(tools) > 0
     trigger_signal = body.get("_trigger_signal")  # 在调用前注入
     thinking_enabled = (
         body.get("thinking", {}).get("type") == "enabled"
@@ -164,7 +184,17 @@ async def _stream_claude_response(
     yield writer.init_event()
 
     start_time = time.time()
+    last_ping = start_time
     error_msg = ""
+
+    def _emit_parser_events():
+        """消费解析器事件并通过 writer 输出 SSE 行"""
+        lines = []
+        events = parser.consume_events()
+        if events:
+            for line in writer.handle_events(events):
+                lines.append(line)
+        return lines
 
     try:
         async for event in client.send_message(session_id, content, tabbit_model):
@@ -175,32 +205,59 @@ async def _stream_claude_response(
                 text = ed["content"]
                 for char in text:
                     parser.feed_char(char)
-                    events = parser.consume_events()
-                    if events:
-                        for line in writer.handle_events(events):
-                            yield line
+                for line in _emit_parser_events():
+                    yield line
             elif et in ("message_finish", "finish"):
                 break
 
+            # ping keep-alive
+            now = time.time()
+            if now - last_ping >= PING_INTERVAL_SECONDS:
+                yield f"event: ping\ndata: {{}}\n\n"
+                last_ping = now
+
         # 流结束
         parser.finish()
-        final_events = parser.consume_events()
-        if final_events:
-            for line in writer.handle_events(final_events):
-                yield line
+        for line in _emit_parser_events():
+            yield line
 
         if token_id and _tm:
             _tm.report_success(token_id)
 
+    except TabbitApiError as e:
+        error_msg = str(e)
+        logger.error("Tabbit upstream error for token %s: code=%s action=%s msg=%s",
+                      token_name, e.code, e.action, error_msg)
+        if token_id and _tm:
+            _tm.report_error(token_id, cooldown=False)
+        # Return upstream error as visible text in the stream so Claude Code shows it
+        if not writer.finished:
+            err_text = build_tabbit_error_message(
+                e,
+                token_value=_token_value_for_id(token_id),
+                local_diagnostics=get_local_tabbit_environment_diagnostics(),
+            )
+            for line in writer.handle_events([
+                {"type": "text", "content": err_text},
+                {"type": "end"},
+            ]):
+                yield line
     except Exception as e:
         error_msg = str(e)
+        logger.error("Stream error for token %s: %s", token_name, error_msg)
         if token_id and _tm:
             _tm.report_error(token_id)
-        # 尝试发送错误后仍然关闭流
-        parser.finish()
-        final_events = parser.consume_events()
-        if final_events:
-            for line in writer.handle_events(final_events):
+        # 即使异常也必须正确关闭流：flush parser → finish writer
+        try:
+            parser.finish()
+            for line in _emit_parser_events():
+                yield line
+        except Exception:
+            pass
+        # 如果 writer 还没 finish（异常发生在 message_start 之后、无任何内容时），
+        # 确保流被正确关闭，避免 Claude Code 永远等待
+        if not writer.finished:
+            for line in writer.handle_events([{"type": "end"}]):
                 yield line
     finally:
         duration = time.time() - start_time
@@ -229,7 +286,7 @@ async def claude_messages(request: Request):
     client, token_name, token_id = await _get_client_and_token(request)
 
     # 模型映射
-    tabbit_model = _resolve_tabbit_model(body.get("model", "best"))
+    tabbit_model = await _resolve_tabbit_model(body.get("model", "best"))
 
     # 工具调用准备
     tools = body.get("tools", [])
@@ -290,6 +347,18 @@ async def claude_messages(request: Request):
                 full_text += event["data"].get("content", "")
         if token_id and _tm:
             _tm.report_success(token_id)
+    except TabbitApiError as e:
+        error_msg = str(e)
+        if token_id and _tm:
+            _tm.report_error(token_id, cooldown=False)
+        raise HTTPException(
+            status_code=502,
+            detail=build_tabbit_error_message(
+                e,
+                token_value=_token_value_for_id(token_id),
+                local_diagnostics=get_local_tabbit_environment_diagnostics(),
+            ),
+        )
     except Exception as e:
         error_msg = str(e)
         if token_id and _tm:
